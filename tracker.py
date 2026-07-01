@@ -45,8 +45,7 @@ ROUND_MAP = {
     "final":         "決賽",
 }
 
-# 溫網 2026 各輪對應日期（估算，以台北時間午後場次 20:00 為預設）
-# 假設首日 6/29（一）
+# 溫網 2026 各輪預計日期（假設首日 6/29）
 ROUND_DATES = {
     "round of 128": [date(2026, 6, 29), date(2026, 6, 30)],
     "first round":  [date(2026, 6, 29), date(2026, 6, 30)],
@@ -74,98 +73,35 @@ HEADERS_JSON = {
 }
 
 
-# ── 資料抓取：Wimbledon JSON（主要）─────────────────────────────────────────
-
-def fetch_wimbledon_json():
-    """嘗試 Wimbledon.com 的 JSON schedule endpoint"""
-    matches = []
-    tournament_start = date(2026, 6, 29)
-    today = datetime.now(TAIPEI).date()
-    day_num = (today - tournament_start).days + 1
-
-    for d in range(max(1, day_num), min(14, day_num + 3)):
-        url = f"https://www.wimbledon.com/en_GB/scores/json/schedule/day.json?d={d}"
-        try:
-            r = requests.get(url, headers=HEADERS_JSON, timeout=10)
-            ct = r.headers.get("Content-Type", "")
-            print(f"  Wimbledon JSON day{d}: HTTP {r.status_code} | Content-Type: {ct}")
-            if r.status_code != 200:
-                continue
-
-            # 先看原始回應確認是否為 JSON
-            raw = r.text[:300]
-            print(f"  Preview: {repr(raw[:200])}")
-
-            if not raw.strip().startswith("{") and not raw.strip().startswith("["):
-                print(f"  → 非 JSON 格式，略過")
-                continue
-
-            data = r.json()
-            print(f"  Keys: {list(data.keys())[:10]}")
-
-            # 根據實際結構解析（待看到 Keys 後補充）
-            raw_str = json.dumps(data).lower()
-            found = [k for k in TRACKED_PLAYERS if k in raw_str]
-            print(f"  Players in JSON: {found}")
-
-            matches.extend(parse_wimbledon_schedule(data, d))
-
-        except Exception as e:
-            print(f"  Wimbledon JSON day{d} error: {e}")
-
-    return matches
-
-
-def parse_wimbledon_schedule(data, day_num):
-    """解析 Wimbledon JSON 結構（根據實際 keys 調整）"""
-    matches = []
-    # 遞迴搜尋包含選手名稱的結構
-    raw = json.dumps(data)
-    for player in TRACKED_PLAYERS:
-        if player in raw.lower():
-            print(f"  ✓ Found {player} in Wimbledon JSON day{day_num}")
-    return matches
-
-
-# ── 資料抓取：ATP Tour 簽表（備用 1）────────────────────────────────────────
+# ── 資料抓取：ATP Tour draw（主要來源）──────────────────────────────────────
 
 def fetch_atp_draws():
-    """ATP Tour Wimbledon draw — 含完整 HTML 診斷"""
+    """ATP Tour Wimbledon draw — 從 bracket 抓取未完成比賽"""
     matches = []
 
-    urls = [
-        ("ATP", "https://www.atptour.com/en/scores/current/wimbledon/540/draws"),
-        ("WTA", "https://www.wtatennis.com/tournaments/1114/wimbledon/2026/draws"),
+    sources = [
+        ("男單", "ATP", "https://www.atptour.com/en/scores/current/wimbledon/540/draws"),
+        ("女單", "WTA", "https://www.wtatennis.com/tournaments/1114/wimbledon/2026/draws"),
     ]
 
-    for label, url in urls:
+    for cat, label, url in sources:
         try:
             r = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
-            print(f"\n  {label} draws: HTTP {r.status_code}")
+            print(f"  {label} draws: HTTP {r.status_code}")
             if r.status_code != 200:
                 continue
 
             soup = BeautifulSoup(r.text, "html.parser")
             text = soup.get_text(separator=" ")
             found = [k for k in TRACKED_PLAYERS if k in text.lower()]
-            print(f"  {label}: tracked players = {found}")
+            print(f"  {label}: tracked players in page = {found}")
 
-            # === 診斷：印出 HTML 結構摘要 ===
-            print(f"\n  === {label} HTML 結構診斷 ===")
-            # 尋找含有選手名稱的父節點
-            for player in found[:2]:  # 只看前 2 個
-                # 找最近的含有選手名的元素
-                els = soup.find_all(string=re.compile(player, re.I))
-                for el in els[:3]:
-                    parent = el.parent
-                    grandparent = parent.parent if parent else None
-                    print(f"  Player '{player}' in <{parent.name}> class={parent.get('class','')}")
-                    if grandparent:
-                        print(f"    parent: <{grandparent.name}> class={grandparent.get('class','')}")
-                    print(f"    text: {el.parent.get_text(' ', strip=True)[:120]}")
+            if not found:
+                print(f"  {label}: no tracked players, skipping")
+                continue
 
-            # 嘗試解析
-            found_matches = parse_atp_draw(soup, label)
+            found_matches = parse_draw_bracket(soup, cat, label)
+            print(f"  {label}: {len(found_matches)} upcoming matches found")
             matches.extend(found_matches)
 
         except Exception as e:
@@ -174,84 +110,109 @@ def fetch_atp_draws():
     return matches
 
 
-def parse_atp_draw(soup, label):
-    """解析 ATP/WTA draw bracket，找出還未比賽的場次"""
+def parse_draw_bracket(soup, cat, label):
+    """解析 draw bracket：每個 .draw-item 是單一選手格，需配對找對手"""
     matches = []
     today = datetime.now(TAIPEI).date()
-    cat = "男單" if label == "ATP" else "女單"
 
-    # ATP Tour draw 的常見 CSS class 模式
-    selectors = [
-        ".draw-match", ".draw-item", "[class*='draw-match']",
-        "[class*='match-node']", "[class*='bracket-match']",
-        "li.draw", "div.match",
-    ]
+    # 收集所有 draw-item 及其選手名稱
+    all_items = soup.select(".draw-item")
+    print(f"  {label}: total draw-items = {len(all_items)}")
 
-    blocks = []
-    for sel in selectors:
-        blocks = soup.select(sel)
-        if blocks:
-            print(f"  {label}: using selector '{sel}', found {len(blocks)} blocks")
-            break
+    # 建立 index → player_name 對映
+    item_players = []
+    for item in all_items:
+        name_el = (
+            item.select_one("div.name a") or
+            item.select_one(".name a") or
+            item.select_one("a[href*='/en/players/']") or
+            item.select_one("a[href*='/players/']")
+        )
+        name = name_el.get_text(strip=True) if name_el else ""
+        item_players.append((item, name))
 
-    if not blocks:
-        print(f"  {label}: no draw block found with known selectors")
-        # 嘗試任何含有 vs 或選手名的段落
-        for el in soup.find_all(["div", "li", "tr"]):
-            el_text = el.get_text(" ", strip=True).lower()
-            if any(k in el_text for k in TRACKED_PLAYERS) and len(el_text) < 300:
-                print(f"  Candidate block: {el.get_text(' ', strip=True)[:150]}")
-        return matches
-
-    for block in blocks:
-        block_text = block.get_text(" ", strip=True)
-        block_lower = block_text.lower()
-        if not any(k in block_lower for k in TRACKED_PLAYERS):
+    # 找出含有追蹤選手的 draw-item，配對相鄰選手
+    for i, (item, player) in enumerate(item_players):
+        if not any(k in player.lower() for k in TRACKED_PLAYERS):
             continue
 
-        # 判斷是否為未完成的比賽（無分數格式）
-        has_score = bool(re.search(r'\b[0-6]\s+[0-6]\b', block_text))
+        # 找對手：嘗試同一父節點的另一個 draw-item
+        parent = item.parent
+        sibling_items = [it for it in parent.select(".draw-item") if it is not item] if parent else []
 
-        # 抓選手名
-        player_els = block.select(
-            ".player-name, .name, [class*='player'], [class*='name'], span, strong"
-        )
-        players = [e.get_text(strip=True) for e in player_els if e.get_text(strip=True)]
-        players = [p for p in players if len(p) > 2 and not p.isdigit()][:2]
+        if sibling_items:
+            # 同父節點策略
+            opp_item, opponent = _get_player_from_item(sibling_items[0])
+        else:
+            # 相鄰索引策略（奇數配偶數）
+            partner_idx = i - 1 if i % 2 == 1 else i + 1
+            if 0 <= partner_idx < len(item_players):
+                _, opponent = item_players[partner_idx]
+            else:
+                opponent = "TBD"
 
-        # 抓輪次
-        round_text = ""
-        round_el = block.find_previous(["h2", "h3", "h4", "div"], class_=re.compile("round|header", re.I))
-        if round_el:
-            round_text = round_el.get_text(strip=True)
-        round_zh = translate_round(round_text)
+        if not opponent or opponent == player:
+            opponent = "TBD"
 
-        # 估算比賽日期
-        match_date = estimate_match_date(round_text, today)
-        start_taipei = datetime.combine(match_date, datetime.min.time()).replace(
-            hour=20, minute=0, tzinfo=TAIPEI
-        )
+        # 確認是否有比分（比賽已結束）
+        context = parent if parent else item
+        context_text = context.get_text(" ", strip=True)
+        # 去掉選手名稱後看是否有分數格式（如 "6 3" "7 6"）
+        stripped = re.sub(re.escape(player), "", context_text, flags=re.I)
+        stripped = re.sub(re.escape(opponent), "", stripped, flags=re.I)
+        has_score = bool(re.search(r'\b[0-7]\s+[0-7]\b', stripped))
 
-        print(f"  {label} match: {players} | round={round_text} | score={has_score} | date={match_date}")
+        # 找輪次
+        round_text = find_round_for_item(item, soup)
+        round_zh   = translate_round(round_text)
 
-        if len(players) == 2 and not has_score:
+        print(f"  {label}: {player} vs {opponent} | round={round_text} | scored={has_score}")
+
+        if not has_score and (opponent != player):
+            match_date   = estimate_match_date(round_text, today)
+            start_taipei = datetime.combine(match_date, datetime.min.time()).replace(
+                hour=20, minute=0, tzinfo=TAIPEI
+            )
             matches.append({
-                "players":      players,
+                "players":      [player, opponent],
                 "start_taipei": start_taipei,
                 "round":        round_zh,
                 "court":        "溫布頓",
                 "category":     cat,
             })
-            print(f"  ✓ Upcoming: {players[0]} vs {players[1]}")
 
     return matches
 
 
+def _get_player_from_item(item):
+    name_el = (
+        item.select_one("div.name a") or
+        item.select_one(".name a") or
+        item.select_one("a[href*='/players/']")
+    )
+    name = name_el.get_text(strip=True) if name_el else ""
+    return item, name
+
+
+def find_round_for_item(item, soup):
+    """往前找最近的輪次標題"""
+    for el in item.find_all_previous():
+        if el.name in ["h2", "h3", "h4"]:
+            t = el.get_text(strip=True).lower()
+            if any(kw in t for kw in ["round", "final", "quarter", "semi"]):
+                return el.get_text(strip=True)
+        if el.get("class"):
+            classes = " ".join(el.get("class", []))
+            if "round-title" in classes or "round-header" in classes or "round-name" in classes:
+                return el.get_text(strip=True)
+    return ""
+
+
 def estimate_match_date(round_text, today):
-    """根據輪次估算比賽日期（取該輪第一個未到的日期）"""
-    round_lower = round_text.lower().strip()
+    """根據輪次估算比賽日期"""
+    rt = round_text.lower().strip()
     for key, dates in ROUND_DATES.items():
-        if key in round_lower:
+        if key in rt:
             for d in dates:
                 if d >= today:
                     return d
@@ -259,14 +220,14 @@ def estimate_match_date(round_text, today):
     return today
 
 
-# ── 資料抓取：ESPN 日期版（備用 2）──────────────────────────────────────────
+# ── 資料抓取：ESPN Live（備用）──────────────────────────────────────────────
 
-def fetch_espn_by_date():
-    """ESPN scoreboard with date param — 只取有比賽資料的"""
+def fetch_espn_live():
+    """ESPN scoreboard — 僅有比賽正在進行時才有資料"""
     matches = []
     taipei_now = datetime.now(TAIPEI)
 
-    for days in range(0, 3):
+    for days in range(0, 2):
         date_str = (taipei_now + timedelta(days=days)).strftime("%Y%m%d")
         for tour, cat in [("atp", "男單"), ("wta", "女單")]:
             url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{tour}/scoreboard?dates={date_str}"
@@ -278,42 +239,28 @@ def fetch_espn_by_date():
                 for event in data.get("events", []):
                     if not any(kw in event.get("name", "").lower() for kw in ["wimbledon", "championship"]):
                         continue
-                    comps = event.get("competitions", [])
-                    if not comps:
-                        continue
-                    print(f"  ESPN {tour} {date_str}: {len(comps)} matches in Wimbledon event")
-                    for comp in comps:
-                        m = parse_espn_comp(comp, event, cat)
-                        if m:
-                            matches.append(m)
+                    for comp in event.get("competitions", []):
+                        players = [c.get("athlete", {}).get("displayName", "") for c in comp.get("competitors", [])]
+                        if len(players) < 2:
+                            continue
+                        if not any(any(k in p.lower() for k in TRACKED_PLAYERS) for p in players):
+                            continue
+                        start_str = comp.get("date", event.get("date", ""))
+                        if not start_str:
+                            continue
+                        start_taipei = datetime.fromisoformat(start_str.replace("Z", "+00:00")).astimezone(TAIPEI)
+                        round_name   = comp.get("notes", [{}])[0].get("headline", "") if comp.get("notes") else ""
+                        matches.append({
+                            "players":      players,
+                            "start_taipei": start_taipei,
+                            "round":        translate_round(round_name),
+                            "court":        comp.get("venue", {}).get("fullName", "") or "溫布頓",
+                            "category":     cat,
+                        })
+                        print(f"  ESPN live: {players[0]} vs {players[1]}")
             except Exception as e:
                 print(f"  ESPN error: {e}")
     return matches
-
-
-def parse_espn_comp(comp, event, cat):
-    try:
-        competitors = comp.get("competitors", [])
-        if len(competitors) < 2:
-            return None
-        players = [c.get("athlete", {}).get("displayName", "") for c in competitors]
-        players_lower = [p.lower() for p in players]
-        if not any(any(key in p for p in players_lower) for key in TRACKED_PLAYERS):
-            return None
-        start_str = comp.get("date", event.get("date", ""))
-        if not start_str:
-            return None
-        start_taipei = datetime.fromisoformat(start_str.replace("Z", "+00:00")).astimezone(TAIPEI)
-        round_name = comp.get("notes", [{}])[0].get("headline", "") if comp.get("notes") else ""
-        return {
-            "players":      players,
-            "start_taipei": start_taipei,
-            "round":        translate_round(round_name),
-            "court":        comp.get("venue", {}).get("fullName", "") or "溫布頓",
-            "category":     cat,
-        }
-    except Exception:
-        return None
 
 
 def translate_round(raw):
@@ -327,8 +274,15 @@ def translate_round(raw):
 # ── 事件去重 ID ───────────────────────────────────────────────────────────────
 
 def make_event_id(players, date_str, category):
+    """
+    Google Calendar event ID 規則：
+    - 只能用 a-v 和 0-9（base32hex）
+    - 5 ~ 1024 字元
+    MD5 hexdigest 只含 0-9, a-f，全部都在合法範圍內
+    前綴用 "tm"（t 和 m 都在 a-v 內）
+    """
     key = f"wimbledon2026-{'-'.join(sorted(p.lower().replace(' ','') for p in players))}-{date_str}-{category}"
-    return "wb" + hashlib.md5(key.encode()).hexdigest()[:12]
+    return "tm" + hashlib.md5(key.encode()).hexdigest()  # 34 chars total, all valid
 
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
@@ -389,32 +343,26 @@ def main():
     print(f"\n🎾 溫布頓賽程追蹤器啟動")
     print(f"⏰ 執行時間：{datetime.now(TAIPEI).strftime('%Y-%m-%d %H:%M')} 台北時間")
 
-    # 優先：Wimbledon 官網 JSON
-    print("\n📡 [1] Wimbledon JSON schedule...")
-    matches = fetch_wimbledon_json()
+    # 主要來源：ATP/WTA 官方簽表
+    print("\n📡 [1] ATP/WTA draw 簽表...")
+    matches = fetch_atp_draws()
     print(f"   → {len(matches)} 場")
 
-    # 次選：ATP/WTA 官方簽表
+    # 備用：ESPN 即時比分
     if not matches:
-        print("\n📡 [2] ATP/WTA draws 頁面...")
-        matches = fetch_atp_draws()
-        print(f"   → {len(matches)} 場")
-
-    # 備用：ESPN（只有 live 時有資料）
-    if not matches:
-        print("\n📡 [3] ESPN scoreboard...")
-        matches = fetch_espn_by_date()
+        print("\n📡 [2] ESPN live scoreboard...")
+        matches = fetch_espn_live()
         print(f"   → {len(matches)} 場")
 
     if not matches:
-        print("\n⚠️  本次無可用賽程資料（休賽日或所有來源受限）")
+        print("\n⚠️  本次無可用賽程（休賽日或比賽時段外）")
         return
 
     print(f"\n📅 更新 Google Calendar（{len(matches)} 場）...")
     try:
         service = get_calendar_service()
         added   = sum(1 for m in matches if create_calendar_event(service, m))
-        print(f"\n✅ 完成：新增 {added} 場，跳過 {len(matches) - added} 場")
+        print(f"\n✅ 完成：新增 {added} 場，跳過 {len(matches) - added} 場（已存在）")
     except Exception as e:
         print(f"❌ Google Calendar 錯誤：{e}")
         raise
