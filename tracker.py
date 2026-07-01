@@ -81,7 +81,8 @@ def fetch_atp_draws():
 
     sources = [
         ("男單", "ATP", "https://www.atptour.com/en/scores/current/wimbledon/540/draws"),
-        ("女單", "WTA", "https://www.wtatennis.com/tournaments/1114/wimbledon/2026/draws"),
+        # WTA 官網是 JS 渲染，暫時停用（改由 ESPN live 補充女單資料）
+        # ("女單", "WTA", "https://www.wtatennis.com/tournaments/1114/wimbledon/2026/draws"),
     ]
 
     for cat, label, url in sources:
@@ -110,6 +111,16 @@ def fetch_atp_draws():
     return matches
 
 
+def expand_name(abbr):
+    """縮寫選手名 → 全名（追蹤選手才展開）"""
+    abbr_lower = abbr.lower()
+    for key, full in PLAYER_DISPLAY.items():
+        if key in abbr_lower:
+            return full
+    # 去掉括號內的種子號碼，如 J. Sinner(1) → J. Sinner
+    return re.sub(r'\(\d+\)', '', abbr).strip()
+
+
 def parse_draw_bracket(soup, cat, label):
     """解析 draw bracket：每個 .draw-item 是單一選手格，需配對找對手"""
     matches = []
@@ -119,7 +130,7 @@ def parse_draw_bracket(soup, cat, label):
     all_items = soup.select(".draw-item")
     print(f"  {label}: total draw-items = {len(all_items)}")
 
-    # 建立 index → player_name 對映
+    # 建立 index → (item, name) 對映
     item_players = []
     for item in all_items:
         name_el = (
@@ -128,47 +139,63 @@ def parse_draw_bracket(soup, cat, label):
             item.select_one("a[href*='/en/players/']") or
             item.select_one("a[href*='/players/']")
         )
-        name = name_el.get_text(strip=True) if name_el else ""
-        item_players.append((item, name))
+        raw_name = name_el.get_text(strip=True) if name_el else ""
+        # 找種子（draw-item 內獨立的 seed span）
+        seed_el = item.select_one(".seed, [class*='seed']")
+        if seed_el:
+            seed = seed_el.get_text(strip=True)
+            raw_name = raw_name.replace(seed, "").strip()
+        item_players.append((item, raw_name))
 
     # 找出含有追蹤選手的 draw-item，配對相鄰選手
-    for i, (item, player) in enumerate(item_players):
-        if not any(k in player.lower() for k in TRACKED_PLAYERS):
+    for i, (item, player_raw) in enumerate(item_players):
+        if not any(k in player_raw.lower() for k in TRACKED_PLAYERS):
             continue
 
-        # 找對手：嘗試同一父節點的另一個 draw-item
-        parent = item.parent
-        sibling_items = [it for it in parent.select(".draw-item") if it is not item] if parent else []
-
-        if sibling_items:
-            # 同父節點策略
-            opp_item, opponent = _get_player_from_item(sibling_items[0])
+        # 找對手：相鄰索引配對（奇偶）
+        partner_idx = i - 1 if i % 2 == 1 else i + 1
+        if 0 <= partner_idx < len(item_players):
+            _, opponent_raw = item_players[partner_idx]
         else:
-            # 相鄰索引策略（奇數配偶數）
-            partner_idx = i - 1 if i % 2 == 1 else i + 1
-            if 0 <= partner_idx < len(item_players):
-                _, opponent = item_players[partner_idx]
-            else:
-                opponent = "TBD"
+            opponent_raw = "TBD"
 
-        if not opponent or opponent == player:
-            opponent = "TBD"
+        player   = expand_name(player_raw)
+        opponent = expand_name(opponent_raw) if opponent_raw else "TBD"
 
-        # 確認是否有比分（比賽已結束）
-        context = parent if parent else item
-        context_text = context.get_text(" ", strip=True)
-        # 去掉選手名稱後看是否有分數格式（如 "6 3" "7 6"）
-        stripped = re.sub(re.escape(player), "", context_text, flags=re.I)
-        stripped = re.sub(re.escape(opponent), "", stripped, flags=re.I)
+        # 確認是否有比分（比賽已結束）—— 往前找含分數的父元素
+        parent = item.parent
+        context_text = parent.get_text(" ", strip=True) if parent else ""
+        stripped = re.sub(r'[A-Z]\.\s*\w+', "", context_text)  # 去選手名
         has_score = bool(re.search(r'\b[0-7]\s+[0-7]\b', stripped))
 
-        # 找輪次
-        round_text = find_round_for_item(item, soup)
-        round_zh   = translate_round(round_text)
+        # 找輪次 —— 在同一輪的 draw-round 容器裡找標題
+        round_text = ""
+        el = item
+        for _ in range(6):
+            el = el.parent
+            if el is None:
+                break
+            # 檢查 class 裡有沒有 "round" 字樣
+            classes = " ".join(el.get("class", []))
+            if "round" in classes.lower():
+                # 找裡面的標題文字
+                title_el = el.select_one("h2, h3, h4, .round-title, [class*='round-header'], [class*='round-name']")
+                if title_el:
+                    round_text = title_el.get_text(strip=True)
+                    break
+                # 或直接用 class 名稱推算
+                for cls in el.get("class", []):
+                    if "round" in cls.lower():
+                        round_text = cls.replace("-", " ").replace("_", " ")
+                        break
+                if round_text:
+                    break
 
-        print(f"  {label}: {player} vs {opponent} | round={round_text} | scored={has_score}")
+        round_zh = translate_round(round_text)
 
-        if not has_score and (opponent != player):
+        print(f"  {label}: {player} vs {opponent} | round={round_text!r} | scored={has_score}")
+
+        if not has_score and opponent and opponent != player:
             match_date   = estimate_match_date(round_text, today)
             start_taipei = datetime.combine(match_date, datetime.min.time()).replace(
                 hour=20, minute=0, tzinfo=TAIPEI
@@ -343,16 +370,16 @@ def main():
     print(f"\n🎾 溫布頓賽程追蹤器啟動")
     print(f"⏰ 執行時間：{datetime.now(TAIPEI).strftime('%Y-%m-%d %H:%M')} 台北時間")
 
-    # 主要來源：ATP/WTA 官方簽表
-    print("\n📡 [1] ATP/WTA draw 簽表...")
+    # [1] ATP draw 簽表（男單）
+    print("\n📡 [1] ATP draw 簽表（男單）...")
     matches = fetch_atp_draws()
-    print(f"   → {len(matches)} 場")
+    print(f"   → {len(matches)} 場（男單）")
 
-    # 備用：ESPN 即時比分
-    if not matches:
-        print("\n📡 [2] ESPN live scoreboard...")
-        matches = fetch_espn_live()
-        print(f"   → {len(matches)} 場")
+    # [2] ESPN 即時比分（女單 + 補充男單 live 資料）
+    print("\n📡 [2] ESPN live scoreboard（女單 + live 補充）...")
+    live_matches = fetch_espn_live()
+    print(f"   → {len(live_matches)} 場（live）")
+    matches.extend(live_matches)
 
     if not matches:
         print("\n⚠️  本次無可用賽程（休賽日或比賽時段外）")
