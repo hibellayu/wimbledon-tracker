@@ -6,18 +6,16 @@ Wimbledon 2026 重點選手賽程追蹤器
 每 2 小時自動執行，更新 Google Calendar
 """
 import os, json, hashlib, re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # ── 設定 ─────────────────────────────────────────────────────────────────────
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-BST    = ZoneInfo("Europe/London")   # UTC+1（夏令，Wimbledon 期間）
 
 TRACKED_PLAYERS = [
     "sinner", "djokovic", "zverev",         # 男單（Alcaraz 腕傷退賽）
@@ -47,14 +45,18 @@ ROUND_MAP = {
 }
 
 # tennis-db.com 的輪次代碼
-TENNISDB_ROUND_MAP = [
-    ("R128", "第一輪"),
-    ("R64",  "第二輪"),
-    ("R32",  "第三輪"),
-    ("R16",  "第四輪"),
-    ("QF",   "四強賽"),
-    ("SF",   "準決賽"),
-]
+ESPN_ROUND_MAP = {
+    "1ST":  "第一輪", "FIRST":  "第一輪",
+    "2ND":  "第二輪", "SECOND": "第二輪",
+    "3RD":  "第三輪", "THIRD":  "第三輪",
+    "4TH":  "第四輪", "FOURTH": "第四輪",
+    "QF":   "四強賽",
+    "SF":   "準決賽",
+    "FINAL":"決賽",
+}
+
+# 溫布頓 2026 ESPN Sports Core API 事件 ID（ATP 與 WTA 共用）
+ESPN_EVENT_ID = "188-2026"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -99,123 +101,79 @@ def _dedup_matches(matches):
     return out
 
 
-# ── 資料抓取：tennis-db.com（主要來源，ATP + WTA）────────────────────────────
+# ── 資料抓取：ESPN Sports Core API（主要來源，ATP + WTA）───────────────────
 
-def fetch_tennisdb():
+def fetch_espn_sports_core():
     """
-    tennis-db.com — 靜態 HTML，同時抓 ATP 男單與 WTA 女單
-    - 有精確的 BST 開賽時間（"Starts at 1:30 PM"）
-    - 自動略過已完賽（有 Match data 連結）和歷史賽季（?season=）
+    ESPN Sports Core API — 完整賽事資料，不被 GitHub Actions 封鎖
+    - ATP 男單 + WTA 女單 各 333 場，全部內嵌在同一個 JSON 回應
+    - 有精確 UTC 時間（`timeValid=True`）或未定時間（`timeValid=False`）
+    - 不含 Qualifying 輪
     """
     matches = []
+    today_utc = datetime.now(timezone.utc).date()
     sources = [
-        (
-            "https://tennis-db.com/tournaments/256/wimbledon",
-            "男單",
-            "/players/",
-        ),
-        (
-            "https://tennis-db.com/wta/tournaments/balldontlie_wta:50/wimbledon",
-            "女單",
-            "/wta/players/",
-        ),
+        (f"http://sports.core.api.espn.com/v2/sports/tennis/leagues/atp/events/{ESPN_EVENT_ID}?lang=en&region=us", "男單"),
+        (f"http://sports.core.api.espn.com/v2/sports/tennis/leagues/wta/events/{ESPN_EVENT_ID}?lang=en&region=us", "女單"),
     ]
-    today = datetime.now(TAIPEI).date()
 
-    for url, category, player_prefix in sources:
+    for url, category in sources:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            print(f"  tennisdb {category}: HTTP {r.status_code}, {len(r.text):,} bytes")
+            r = requests.get(url, headers=HEADERS_JSON, timeout=20)
+            print(f"  ESPN sports core {category}: HTTP {r.status_code}")
             if r.status_code != 200:
                 continue
 
-            soup = BeautifulSoup(r.text, "html.parser")
-            seen_pairs = set()
+            comps = r.json().get("competitions", [])
+            print(f"  {category} 總場次: {len(comps)}")
 
-            for tr in soup.find_all("tr"):
-                # 跳過歷史賽季的列（含 ?season= 連結）
-                if any("?season=" in (a.get("href", "")) for a in tr.find_all("a")):
+            for comp in comps:
+                # 略過 Qualifying
+                round_info = comp.get("round", {})
+                round_desc = round_info.get("description", "")
+                if "Qualifying" in round_desc:
                     continue
 
-                # 取得選手連結（排除 H2H 和 match data 連結）
-                player_links = [
-                    a for a in tr.find_all("a", href=True)
-                    if player_prefix in a.get("href", "")
-                    and "/rivalries/" not in a.get("href", "")
-                    and "/matches/" not in a.get("href", "")
-                ]
-                if len(player_links) < 2:
+                # 篩選未完賽（雙方 winner 皆為 False）
+                competitors = comp.get("competitors", [])
+                if len(competitors) < 2:
+                    continue
+                if any(cp.get("winner", False) for cp in competitors):
                     continue
 
-                p1_raw = player_links[0].get_text(strip=True)
-                p2_raw = player_links[1].get_text(strip=True)
+                p1_raw = competitors[0].get("name", "")
+                p2_raw = competitors[1].get("name", "")
 
                 # 確認是追蹤選手之一
                 if not (any(k in p1_raw.lower() for k in TRACKED_PLAYERS) or
                         any(k in p2_raw.lower() for k in TRACKED_PLAYERS)):
                     continue
 
-                row_text = tr.get_text(" ", strip=True)
-
-                # 跳過已完賽（有 "Match data" 連結）
-                if tr.find("a", string=lambda s: s and "Match data" in s):
+                # 日期／時間（UTC → 台北）
+                date_str = comp.get("date", "")
+                if not date_str:
+                    continue
+                comp_utc = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                if comp_utc.date() < today_utc:
                     continue
 
-                # 只保留未開賽（score = 0–0）
-                if "0–0" not in row_text:   # "0–0" U+2013
-                    continue
-
-                # 解析日期（只要 2026 年的）
-                date_m = re.search(
-                    r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+),\s+2026',
-                    row_text
-                )
-                if not date_m:
-                    continue
-                match_date = datetime.strptime(date_m.group(0), "%b %d, %Y").date()
-                if match_date < today:
-                    continue
-
-                # 解析輪次
-                round_zh = "待定"
-                for code, name in TENNISDB_ROUND_MAP:
-                    if code in row_text:
-                        round_zh = name
-                        break
-                if round_zh == "待定" and re.search(r'\bF\b', row_text):
-                    round_zh = "決賽"
-
-                # 解析開賽時間（BST → 台北）
-                time_m = re.search(
-                    r'[Ss]tarts [Aa]t\s+(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)',
-                    row_text
-                )
-                if time_m:
-                    hour   = int(time_m.group(1))
-                    minute = int(time_m.group(2))
-                    ampm   = time_m.group(3).upper()
-                    if ampm == "PM" and hour != 12:
-                        hour += 12
-                    elif ampm == "AM" and hour == 12:
-                        hour = 0
-                    # BST (Europe/London, UTC+1) → 台北 (UTC+8)
-                    bst_dt = datetime(
-                        match_date.year, match_date.month, match_date.day,
-                        hour, minute, tzinfo=BST
-                    )
-                    start_taipei = bst_dt.astimezone(TAIPEI)
+                time_valid = comp.get("timeValid", False)
+                if time_valid:
+                    start_taipei = comp_utc.astimezone(TAIPEI)
                 else:
-                    # 無精確時間 → 預設 20:00 台北
+                    # 時間未定 → 預設台北 20:00 那天
+                    match_date = comp_utc.astimezone(TAIPEI).date()
                     start_taipei = datetime(
                         match_date.year, match_date.month, match_date.day,
                         20, 0, tzinfo=TAIPEI
                     )
 
-                # 去重
-                pair_key = tuple(sorted([p1_raw.lower(), p2_raw.lower()]))
-                if pair_key in seen_pairs:
-                    continue
-                seen_pairs.add(pair_key)
+                # 輪次
+                abbrev = round_info.get("abbreviation", "").upper()
+                round_zh = ESPN_ROUND_MAP.get(abbrev, round_desc or "待定")
+
+                # 球場
+                court = comp.get("court", {}).get("description", "") or "溫布頓"
 
                 p1 = expand_name(p1_raw)
                 p2 = expand_name(p2_raw)
@@ -224,67 +182,19 @@ def fetch_tennisdb():
                     "players":      [p1, p2],
                     "start_taipei": start_taipei,
                     "round":        round_zh,
-                    "court":        "溫布頓",
+                    "court":        court,
                     "category":     category,
                 })
-                print(f"  tennisdb ✓ {category}: {p1} vs {p2} | {round_zh} | {start_taipei.strftime('%m/%d %H:%M')} 台北")
+                time_tag = start_taipei.strftime('%m/%d %H:%M') + (" ✓時間" if time_valid else " ⚠️待定")
+                print(f"  ESPN core ✓ {category}: {p1} vs {p2} | {round_zh} | {time_tag} 台北")
 
         except Exception as e:
-            print(f"  tennisdb error ({category}): {e}")
+            print(f"  ESPN sports core error ({category}): {e}")
             import traceback; traceback.print_exc()
 
     return _dedup_matches(matches)
 
 
-# ── 資料抓取：ESPN Live（即時補充精確時間）───────────────────────────────────
-
-def fetch_espn_live():
-    """ESPN scoreboard — 補充即時比賽的精確時間（只在比賽進行中有效）"""
-    matches = []
-    taipei_now = datetime.now(TAIPEI)
-    for days in range(0, 2):
-        date_str = (taipei_now + timedelta(days=days)).strftime("%Y%m%d")
-        for tour, cat in [("atp", "男單"), ("wta", "女單")]:
-            url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{tour}/scoreboard?dates={date_str}"
-            try:
-                r = requests.get(url, headers=HEADERS_JSON, timeout=10)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                for event in data.get("events", []):
-                    if not any(kw in event.get("name", "").lower() for kw in ["wimbledon", "championship"]):
-                        continue
-                    for comp in event.get("competitions", []):
-                        players = [
-                            c.get("athlete", {}).get("displayName", "")
-                            for c in comp.get("competitors", [])
-                        ]
-                        if len(players) < 2:
-                            continue
-                        if not any(any(k in p.lower() for k in TRACKED_PLAYERS) for p in players):
-                            continue
-                        start_str = comp.get("date", event.get("date", ""))
-                        if not start_str:
-                            continue
-                        start_taipei = datetime.fromisoformat(
-                            start_str.replace("Z", "+00:00")
-                        ).astimezone(TAIPEI)
-                        round_name = (
-                            comp.get("notes", [{}])[0].get("headline", "")
-                            if comp.get("notes") else ""
-                        )
-                        p1, p2 = expand_name(players[0]), expand_name(players[1])
-                        matches.append({
-                            "players":      [p1, p2],
-                            "start_taipei": start_taipei,
-                            "round":        translate_round(round_name),
-                            "court":        comp.get("venue", {}).get("fullName", "") or "溫布頓",
-                            "category":     cat,
-                        })
-                        print(f"  ESPN live ✓: {p1} vs {p2} | {start_taipei.strftime('%m/%d %H:%M')}")
-            except Exception as e:
-                print(f"  ESPN error: {e}")
-    return _dedup_matches(matches)
 
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
@@ -352,28 +262,10 @@ def main():
     print(f"\n🎾 溫布頓賽程追蹤器啟動")
     print(f"⏰ 執行時間：{datetime.now(TAIPEI).strftime('%Y-%m-%d %H:%M')} 台北時間")
 
-    # [1] tennis-db.com — 靜態 HTML，ATP + WTA 一起抓，有精確 BST 時間
-    print("\n📡 [1] tennis-db.com（ATP 男單 + WTA 女單）...")
-    matches = fetch_tennisdb()
-    existing_pairs = {frozenset(p.lower() for p in m["players"]) for m in matches}
+    # ESPN Sports Core API — ATP 男單 + WTA 女單，不被 GitHub Actions 封鎖
+    print("\n📡 ESPN Sports Core API（ATP 男單 + WTA 女單）...")
+    matches = fetch_espn_sports_core()
     print(f"   → 找到 {len(matches)} 場")
-
-    # [2] ESPN Live — 比賽進行中時取得更精確的時間
-    print("\n📡 [2] ESPN live（即時時間補充）...")
-    live_matches = fetch_espn_live()
-    for m in live_matches:
-        pair = frozenset(p.lower() for p in m["players"])
-        if pair not in existing_pairs:
-            matches.append(m)
-            existing_pairs.add(pair)
-        else:
-            # 以 live 資料更新時間
-            for existing in matches:
-                if frozenset(p.lower() for p in existing["players"]) == pair:
-                    existing["start_taipei"] = m["start_taipei"]
-                    print(f"  ⏰ 更新時間：{m['players'][0]} vs {m['players'][1]} → {m['start_taipei'].strftime('%H:%M')}")
-                    break
-    print(f"   → 合計 {len(matches)} 場（ESPN 補充後）")
 
     if not matches:
         print("\n⚠️  本次無可用賽程資料")
