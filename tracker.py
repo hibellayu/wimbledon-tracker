@@ -216,12 +216,30 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
-def event_exists(service, event_id):
+def event_exists(service, event_id, players=None, start=None):
+    """先用 ID 查，若找不到再用選手名稱在前後 24h 內搜尋（防止手動建立的事件被重複）"""
     try:
         service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
         return True
     except Exception:
-        return False
+        pass
+    if players and start:
+        fragment = f"{players[0]} vs {players[1]}"
+        try:
+            result = service.events().list(
+                calendarId=CALENDAR_ID,
+                q=fragment,
+                timeMin=(start - timedelta(hours=24)).isoformat(),
+                timeMax=(start + timedelta(hours=24)).isoformat(),
+                singleEvents=True,
+            ).execute()
+            for item in result.get("items", []):
+                if fragment in item.get("summary", "") and item.get("status") != "cancelled":
+                    print(f"  ⏭️  依名稱查到已存在：{fragment}")
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 def create_calendar_event(service, match):
@@ -235,7 +253,7 @@ def create_calendar_event(service, match):
     date_str = start.strftime("%Y%m%d")
     event_id = make_event_id(players, date_str, cat)
 
-    if event_exists(service, event_id):
+    if event_exists(service, event_id, players, start):
         print(f"  ⏭️  已存在：{players[0]} vs {players[1]}")
         return False
 
