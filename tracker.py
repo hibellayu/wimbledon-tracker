@@ -4,7 +4,7 @@ Wimbledon 2026 重點選手賽程追蹤器
 每 2 小時自動抓取賽程，更新 Google Calendar
 """
 import os, json, hashlib, re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 
 import requests
@@ -45,6 +45,24 @@ ROUND_MAP = {
     "final":         "決賽",
 }
 
+# 溫網 2026 各輪對應日期（估算，以台北時間午後場次 20:00 為預設）
+# 假設首日 6/29（一）
+ROUND_DATES = {
+    "round of 128": [date(2026, 6, 29), date(2026, 6, 30)],
+    "first round":  [date(2026, 6, 29), date(2026, 6, 30)],
+    "round of 64":  [date(2026, 7, 1),  date(2026, 7, 2)],
+    "second round": [date(2026, 7, 1),  date(2026, 7, 2)],
+    "round of 32":  [date(2026, 7, 3),  date(2026, 7, 4)],
+    "third round":  [date(2026, 7, 3),  date(2026, 7, 4)],
+    "round of 16":  [date(2026, 7, 6),  date(2026, 7, 7)],
+    "fourth round": [date(2026, 7, 6),  date(2026, 7, 7)],
+    "quarterfinal": [date(2026, 7, 8),  date(2026, 7, 9)],
+    "quarter-final":[date(2026, 7, 8),  date(2026, 7, 9)],
+    "semifinal":    [date(2026, 7, 10), date(2026, 7, 11)],
+    "semi-final":   [date(2026, 7, 10), date(2026, 7, 11)],
+    "final":        [date(2026, 7, 12), date(2026, 7, 13)],
+}
+
 HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -56,37 +74,220 @@ HEADERS_JSON = {
 }
 
 
-# ── 資料抓取：ESPN with date（主要）─────────────────────────────────────────
+# ── 資料抓取：Wimbledon JSON（主要）─────────────────────────────────────────
+
+def fetch_wimbledon_json():
+    """嘗試 Wimbledon.com 的 JSON schedule endpoint"""
+    matches = []
+    tournament_start = date(2026, 6, 29)
+    today = datetime.now(TAIPEI).date()
+    day_num = (today - tournament_start).days + 1
+
+    for d in range(max(1, day_num), min(14, day_num + 3)):
+        url = f"https://www.wimbledon.com/en_GB/scores/json/schedule/day.json?d={d}"
+        try:
+            r = requests.get(url, headers=HEADERS_JSON, timeout=10)
+            ct = r.headers.get("Content-Type", "")
+            print(f"  Wimbledon JSON day{d}: HTTP {r.status_code} | Content-Type: {ct}")
+            if r.status_code != 200:
+                continue
+
+            # 先看原始回應確認是否為 JSON
+            raw = r.text[:300]
+            print(f"  Preview: {repr(raw[:200])}")
+
+            if not raw.strip().startswith("{") and not raw.strip().startswith("["):
+                print(f"  → 非 JSON 格式，略過")
+                continue
+
+            data = r.json()
+            print(f"  Keys: {list(data.keys())[:10]}")
+
+            # 根據實際結構解析（待看到 Keys 後補充）
+            raw_str = json.dumps(data).lower()
+            found = [k for k in TRACKED_PLAYERS if k in raw_str]
+            print(f"  Players in JSON: {found}")
+
+            matches.extend(parse_wimbledon_schedule(data, d))
+
+        except Exception as e:
+            print(f"  Wimbledon JSON day{d} error: {e}")
+
+    return matches
+
+
+def parse_wimbledon_schedule(data, day_num):
+    """解析 Wimbledon JSON 結構（根據實際 keys 調整）"""
+    matches = []
+    # 遞迴搜尋包含選手名稱的結構
+    raw = json.dumps(data)
+    for player in TRACKED_PLAYERS:
+        if player in raw.lower():
+            print(f"  ✓ Found {player} in Wimbledon JSON day{day_num}")
+    return matches
+
+
+# ── 資料抓取：ATP Tour 簽表（備用 1）────────────────────────────────────────
+
+def fetch_atp_draws():
+    """ATP Tour Wimbledon draw — 含完整 HTML 診斷"""
+    matches = []
+
+    urls = [
+        ("ATP", "https://www.atptour.com/en/scores/current/wimbledon/540/draws"),
+        ("WTA", "https://www.wtatennis.com/tournaments/1114/wimbledon/2026/draws"),
+    ]
+
+    for label, url in urls:
+        try:
+            r = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
+            print(f"\n  {label} draws: HTTP {r.status_code}")
+            if r.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            text = soup.get_text(separator=" ")
+            found = [k for k in TRACKED_PLAYERS if k in text.lower()]
+            print(f"  {label}: tracked players = {found}")
+
+            # === 診斷：印出 HTML 結構摘要 ===
+            print(f"\n  === {label} HTML 結構診斷 ===")
+            # 尋找含有選手名稱的父節點
+            for player in found[:2]:  # 只看前 2 個
+                # 找最近的含有選手名的元素
+                els = soup.find_all(string=re.compile(player, re.I))
+                for el in els[:3]:
+                    parent = el.parent
+                    grandparent = parent.parent if parent else None
+                    print(f"  Player '{player}' in <{parent.name}> class={parent.get('class','')}")
+                    if grandparent:
+                        print(f"    parent: <{grandparent.name}> class={grandparent.get('class','')}")
+                    print(f"    text: {el.parent.get_text(' ', strip=True)[:120]}")
+
+            # 嘗試解析
+            found_matches = parse_atp_draw(soup, label)
+            matches.extend(found_matches)
+
+        except Exception as e:
+            print(f"  {label} error: {e}")
+
+    return matches
+
+
+def parse_atp_draw(soup, label):
+    """解析 ATP/WTA draw bracket，找出還未比賽的場次"""
+    matches = []
+    today = datetime.now(TAIPEI).date()
+    cat = "男單" if label == "ATP" else "女單"
+
+    # ATP Tour draw 的常見 CSS class 模式
+    selectors = [
+        ".draw-match", ".draw-item", "[class*='draw-match']",
+        "[class*='match-node']", "[class*='bracket-match']",
+        "li.draw", "div.match",
+    ]
+
+    blocks = []
+    for sel in selectors:
+        blocks = soup.select(sel)
+        if blocks:
+            print(f"  {label}: using selector '{sel}', found {len(blocks)} blocks")
+            break
+
+    if not blocks:
+        print(f"  {label}: no draw block found with known selectors")
+        # 嘗試任何含有 vs 或選手名的段落
+        for el in soup.find_all(["div", "li", "tr"]):
+            el_text = el.get_text(" ", strip=True).lower()
+            if any(k in el_text for k in TRACKED_PLAYERS) and len(el_text) < 300:
+                print(f"  Candidate block: {el.get_text(' ', strip=True)[:150]}")
+        return matches
+
+    for block in blocks:
+        block_text = block.get_text(" ", strip=True)
+        block_lower = block_text.lower()
+        if not any(k in block_lower for k in TRACKED_PLAYERS):
+            continue
+
+        # 判斷是否為未完成的比賽（無分數格式）
+        has_score = bool(re.search(r'\b[0-6]\s+[0-6]\b', block_text))
+
+        # 抓選手名
+        player_els = block.select(
+            ".player-name, .name, [class*='player'], [class*='name'], span, strong"
+        )
+        players = [e.get_text(strip=True) for e in player_els if e.get_text(strip=True)]
+        players = [p for p in players if len(p) > 2 and not p.isdigit()][:2]
+
+        # 抓輪次
+        round_text = ""
+        round_el = block.find_previous(["h2", "h3", "h4", "div"], class_=re.compile("round|header", re.I))
+        if round_el:
+            round_text = round_el.get_text(strip=True)
+        round_zh = translate_round(round_text)
+
+        # 估算比賽日期
+        match_date = estimate_match_date(round_text, today)
+        start_taipei = datetime.combine(match_date, datetime.min.time()).replace(
+            hour=20, minute=0, tzinfo=TAIPEI
+        )
+
+        print(f"  {label} match: {players} | round={round_text} | score={has_score} | date={match_date}")
+
+        if len(players) == 2 and not has_score:
+            matches.append({
+                "players":      players,
+                "start_taipei": start_taipei,
+                "round":        round_zh,
+                "court":        "溫布頓",
+                "category":     cat,
+            })
+            print(f"  ✓ Upcoming: {players[0]} vs {players[1]}")
+
+    return matches
+
+
+def estimate_match_date(round_text, today):
+    """根據輪次估算比賽日期（取該輪第一個未到的日期）"""
+    round_lower = round_text.lower().strip()
+    for key, dates in ROUND_DATES.items():
+        if key in round_lower:
+            for d in dates:
+                if d >= today:
+                    return d
+            return dates[-1]
+    return today
+
+
+# ── 資料抓取：ESPN 日期版（備用 2）──────────────────────────────────────────
 
 def fetch_espn_by_date():
-    """ESPN scoreboard 加上日期參數，取今明兩天的賽程"""
+    """ESPN scoreboard with date param — 只取有比賽資料的"""
     matches = []
     taipei_now = datetime.now(TAIPEI)
 
     for days in range(0, 3):
         date_str = (taipei_now + timedelta(days=days)).strftime("%Y%m%d")
-        for tour, label in [("atp", "男"), ("wta", "女")]:
+        for tour, cat in [("atp", "男單"), ("wta", "女單")]:
             url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{tour}/scoreboard?dates={date_str}"
             try:
                 r = requests.get(url, headers=HEADERS_JSON, timeout=10)
-                print(f"  ESPN {label}單 {date_str}: HTTP {r.status_code}")
                 if r.status_code != 200:
                     continue
-                data   = r.json()
-                events = data.get("events", [])
-
-                for event in events:
-                    name = event.get("name", "")
-                    print(f"    Event: {name} ({len(event.get('competitions', []))} comps)")
-                    if not any(kw in name.lower() for kw in ["wimbledon", "championship"]):
+                data = r.json()
+                for event in data.get("events", []):
+                    if not any(kw in event.get("name", "").lower() for kw in ["wimbledon", "championship"]):
                         continue
-                    cat = "女單" if tour == "wta" else "男單"
-                    for comp in event.get("competitions", []):
+                    comps = event.get("competitions", [])
+                    if not comps:
+                        continue
+                    print(f"  ESPN {tour} {date_str}: {len(comps)} matches in Wimbledon event")
+                    for comp in comps:
                         m = parse_espn_comp(comp, event, cat)
                         if m:
                             matches.append(m)
             except Exception as e:
-                print(f"  ESPN error ({date_str} {label}): {e}")
+                print(f"  ESPN error: {e}")
     return matches
 
 
@@ -95,172 +296,24 @@ def parse_espn_comp(comp, event, cat):
         competitors = comp.get("competitors", [])
         if len(competitors) < 2:
             return None
-
         players = [c.get("athlete", {}).get("displayName", "") for c in competitors]
         players_lower = [p.lower() for p in players]
-        print(f"      Players: {players}")
-
         if not any(any(key in p for p in players_lower) for key in TRACKED_PLAYERS):
             return None
-
         start_str = comp.get("date", event.get("date", ""))
         if not start_str:
             return None
-        start_utc    = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-        start_taipei = start_utc.astimezone(TAIPEI)
-
-        round_name = ""
-        if comp.get("notes"):
-            round_name = comp["notes"][0].get("headline", "")
-        round_zh = translate_round(round_name)
-
+        start_taipei = datetime.fromisoformat(start_str.replace("Z", "+00:00")).astimezone(TAIPEI)
+        round_name = comp.get("notes", [{}])[0].get("headline", "") if comp.get("notes") else ""
         return {
             "players":      players,
             "start_taipei": start_taipei,
-            "round":        round_zh,
+            "round":        translate_round(round_name),
             "court":        comp.get("venue", {}).get("fullName", "") or "溫布頓",
             "category":     cat,
         }
-    except Exception as e:
-        print(f"      parse_espn_comp error: {e}")
+    except Exception:
         return None
-
-
-# ── 資料抓取：Wimbledon.com 嵌入 JSON（備用 1）──────────────────────────────
-
-def fetch_wimbledon_json():
-    """嘗試從 Wimbledon.com 頁面的 __NEXT_DATA__ 或 JSON API 取得資料"""
-    matches = []
-
-    # 1. 嘗試直接 JSON schedule endpoint
-    taipei_now = datetime.now(TAIPEI)
-    tournament_start = datetime(2026, 6, 29, tzinfo=TAIPEI)
-    day_num = (taipei_now.date() - tournament_start.date()).days + 1
-
-    json_urls = []
-    for d in range(max(1, day_num), min(14, day_num + 3)):
-        json_urls.append(f"https://www.wimbledon.com/en_GB/scores/json/schedule/day.json?d={d}")
-        json_urls.append(f"https://www.wimbledon.com/en_GB/scores/json/schedule/day{d}.json")
-
-    for url in json_urls:
-        try:
-            r = requests.get(url, headers=HEADERS_JSON, timeout=10)
-            print(f"  Wimbledon JSON {url}: HTTP {r.status_code}")
-            if r.status_code == 200:
-                data = r.json()
-                print(f"    Keys: {list(data.keys())[:8]}")
-                # 嘗試解析
-                found = parse_wimbledon_json(data, taipei_now)
-                matches.extend(found)
-                if found:
-                    return matches
-        except Exception as e:
-            if "Expecting value" not in str(e):  # 只印非 JSON 解析錯誤
-                print(f"  Wimbledon JSON error: {e}")
-
-    # 2. 嘗試從 HTML 頁面抽取 __NEXT_DATA__
-    try:
-        r = requests.get(
-            "https://www.wimbledon.com/en_GB/scores/schedule/index.html",
-            headers=HEADERS_BROWSER, timeout=15
-        )
-        print(f"\n  Wimbledon HTML: HTTP {r.status_code}")
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            next_data = soup.find("script", id="__NEXT_DATA__")
-            if next_data:
-                print("  Wimbledon: found __NEXT_DATA__")
-                try:
-                    page_data = json.loads(next_data.string)
-                    found = parse_wimbledon_json(page_data, taipei_now)
-                    matches.extend(found)
-                except Exception as e:
-                    print(f"  __NEXT_DATA__ parse error: {e}")
-            else:
-                # 找其他 JSON 嵌入
-                scripts = soup.find_all("script", type="application/json")
-                print(f"  Wimbledon: {len(scripts)} JSON scripts in page")
-                for sc in scripts[:3]:
-                    print(f"    Script preview: {(sc.string or '')[:200]}")
-    except Exception as e:
-        print(f"  Wimbledon HTML error: {e}")
-
-    return matches
-
-
-def parse_wimbledon_json(data, taipei_now):
-    """遞迴搜尋 Wimbledon JSON 中的選手名稱"""
-    matches = []
-    raw = json.dumps(data).lower()
-    found = [k for k in TRACKED_PLAYERS if k in raw]
-    if found:
-        print(f"  Wimbledon JSON: tracked players found = {found}")
-    return matches
-
-
-# ── 資料抓取：ATP Tour 官網（備用 2）────────────────────────────────────────
-
-def fetch_atp_draws():
-    """ATP Tour 溫布頓簽表頁面（靜態 HTML）"""
-    matches = []
-    url = "https://www.atptour.com/en/scores/current/wimbledon/540/draws"
-    try:
-        r = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
-        print(f"\n  ATP Tour: HTTP {r.status_code}")
-        if r.status_code != 200:
-            return matches
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(separator=" ")
-        found = [k for k in TRACKED_PLAYERS if k in text.lower()]
-        print(f"  ATP Tour: tracked players = {found}")
-
-        if not found:
-            print(f"  ATP Tour page preview: {text[:500]}")
-            return matches
-
-        taipei_now = datetime.now(TAIPEI)
-        # ATP draw shows matches; without exact time, use BST 12:00 as placeholder
-        for player_key in TRACKED_PLAYERS:
-            idx = text.lower().find(player_key)
-            if idx < 0:
-                continue
-            # 找 vs 附近的兩個選手
-            snippet = text[max(0, idx-100):idx+200]
-            vs_idx = snippet.lower().find(" vs ")
-            if vs_idx < 0:
-                vs_idx = snippet.lower().find(" d. ")  # 已完成的比賽格式
-            print(f"  ATP snippet for {player_key}: ...{snippet.strip()[:150]}...")
-
-    except Exception as e:
-        print(f"  ATP Tour error: {e}")
-
-    return matches
-
-
-# ── 資料抓取：BBC Sport（備用 3）─────────────────────────────────────────────
-
-def fetch_bbc_schedule():
-    """BBC Sport 溫布頓頁面"""
-    matches = []
-    urls = [
-        "https://www.bbc.com/sport/tennis/wimbledon",
-        "https://www.bbc.co.uk/sport/tennis/wimbledon",
-        "https://www.bbc.com/sport/tennis",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, headers=HEADERS_BROWSER, timeout=15)
-            print(f"  BBC ({url}): HTTP {r.status_code}")
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "html.parser")
-                text = soup.get_text(separator=" ")
-                found = [k for k in TRACKED_PLAYERS if k in text.lower()]
-                print(f"  BBC: players found = {found}")
-                break
-        except Exception as e:
-            print(f"  BBC error: {e}")
-    return matches
 
 
 def translate_round(raw):
@@ -336,31 +389,32 @@ def main():
     print(f"\n🎾 溫布頓賽程追蹤器啟動")
     print(f"⏰ 執行時間：{datetime.now(TAIPEI).strftime('%Y-%m-%d %H:%M')} 台北時間")
 
-    print("\n📡 [1] ESPN Scoreboard（含日期參數）...")
-    matches = fetch_espn_by_date()
+    # 優先：Wimbledon 官網 JSON
+    print("\n📡 [1] Wimbledon JSON schedule...")
+    matches = fetch_wimbledon_json()
     print(f"   → {len(matches)} 場")
 
+    # 次選：ATP/WTA 官方簽表
     if not matches:
-        print("\n📡 [2] Wimbledon 官網 JSON...")
-        matches = fetch_wimbledon_json()
-        print(f"   → {len(matches)} 場")
-
-    if not matches:
-        print("\n📡 [3] ATP Tour 簽表頁...")
+        print("\n📡 [2] ATP/WTA draws 頁面...")
         matches = fetch_atp_draws()
         print(f"   → {len(matches)} 場")
 
+    # 備用：ESPN（只有 live 時有資料）
     if not matches:
-        print("\n📡 [4] BBC Sport（診斷用）...")
-        fetch_bbc_schedule()
-        print("\n⚠️  所有來源均無可用賽程資料，本次跳過 Calendar 更新")
+        print("\n📡 [3] ESPN scoreboard...")
+        matches = fetch_espn_by_date()
+        print(f"   → {len(matches)} 場")
+
+    if not matches:
+        print("\n⚠️  本次無可用賽程資料（休賽日或所有來源受限）")
         return
 
-    print(f"\n📅 更新 Google Calendar（共 {len(matches)} 場）...")
+    print(f"\n📅 更新 Google Calendar（{len(matches)} 場）...")
     try:
         service = get_calendar_service()
         added   = sum(1 for m in matches if create_calendar_event(service, m))
-        print(f"\n✅ 完成：新增 {added} 場，跳過 {len(matches) - added} 場（已存在）")
+        print(f"\n✅ 完成：新增 {added} 場，跳過 {len(matches) - added} 場")
     except Exception as e:
         print(f"❌ Google Calendar 錯誤：{e}")
         raise
